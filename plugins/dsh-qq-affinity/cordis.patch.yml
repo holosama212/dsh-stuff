@@ -1,0 +1,4 @@
+# dsh-qq-affinity bundle patch: mount the plugin under a stable id.
+- insert:
+    - id: qq-affinity
+      name: 'dsh-qq-affinity'

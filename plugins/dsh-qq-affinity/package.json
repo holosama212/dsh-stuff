@@ -1,0 +1,25 @@
+{
+  "name": "dsh-qq-affinity",
+  "version": "0.1.0",
+  "description": "Per-member affinity (0-100) for group chats on DeepSeek Harness: each person keeps their own persistent score, with an affinity tool and a prompt hint",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {},
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "affinity",
+    "qq",
+    "group"
+  ]
+}

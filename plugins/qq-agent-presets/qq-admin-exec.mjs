@@ -1,0 +1,286 @@
+// 管理员私聊专用：本机 PowerShell 执行工具。
+//
+// 为什么要自己写一个（2026-10-26 实测）：
+//   QQ 通道里的 agent 挂 preset 后，**不依赖宿主服务的 scoped 工具能正常到达模型**
+//   （`tool-web` 的 web_search/web_fetch 实测可用，能搜回真实标题），
+//   但 `dsh-tool-pwsh` / `dsh-tool-fs` 这类工具的执行器（pwsh-sandbox、fs service）
+//   是**宿主层服务**，在 preset realm 里够不到 ⇒ 注册不出来，模型目录里就是没有 pwsh。
+//   对照实验：`/preset standard`（部署默认组合）在 QQ 里同样跑不了命令，
+//   所以这不是我这份 preset 写错，是通道 agent 拿不到宿主执行器。
+//
+// 本文件不 import 任何东西（宿主包在 profile 目录外，preset realm 里解析不到），
+// 直接用 node 内置 child_process 起 pwsh，注册成 scoped 工具——和通道的 qq_* 工具同一条路子。
+//
+// 边界：按 session id 前缀白名单放行（只有白名单里的私聊能真执行）。群聊成员即使在
+//   群里把 preset 切过来也调不动——群聊 session id 是 onebot-group-… 不在白名单。
+//   白名单优先读运行时文件（改文件立即生效，不用重启）；文件不存在时用下面的内置兜底。
+import { spawn } from 'node:child_process'
+import { readFileSync, statSync, unlinkSync, readdirSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+
+export const name = 'qq-admin-exec'
+
+export const inject = ['tools']
+
+/** 内置兜底白名单（session id 前缀；OneBot 私聊形如 onebot-private-<QQ>-<rand>）。 */
+const FALLBACK_ALLOW = ['onebot-private-OWNER_QQ']
+
+/** 运行时白名单文件：每行一个前缀，# 开头算注释。 */
+const ALLOW_FILE = 'C:\\\\Users\\\\USER\\qq-bridge-0.2.1-r1\\state\\exec-allow.txt'
+
+const allowCache = { mtime: -1, prefixes: FALLBACK_ALLOW }
+
+function allowPrefixes() {
+  try {
+    const st = statSync(ALLOW_FILE)
+    if (st.mtimeMs === allowCache.mtime) return allowCache.prefixes
+    const lines = readFileSync(ALLOW_FILE, 'utf8').split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l !== '' && !l.startsWith('#'))
+    allowCache.mtime = st.mtimeMs
+    allowCache.prefixes = lines.length > 0 ? lines : FALLBACK_ALLOW
+    return allowCache.prefixes
+  } catch {
+    const fromEnv = typeof process.env.QQ_ADMIN_EXEC_SESSIONS === 'string' && process.env.QQ_ADMIN_EXEC_SESSIONS !== ''
+      ? process.env.QQ_ADMIN_EXEC_SESSIONS.split(',').map((s) => s.trim()).filter(Boolean)
+      : null
+    if (fromEnv && fromEnv.length > 0) return fromEnv
+    return allowCache.prefixes
+  }
+}
+
+
+/** 输出截断上限：QQ 一条消息塞不下几 KB，超了给尾部 + 提示。 */
+const MAX_OUTPUT_CHARS = 12000
+const DEFAULT_TIMEOUT_MS = 60000
+const MAX_TIMEOUT_MS = 300000
+
+/** 执行器候选：本机没装 PowerShell 7（宿主的「pwsh 工具」实测也是 5.1 的 powershell.exe），
+ *  所以先试 pwsh，ENOENT 就自动降级到 powershell.exe。 */
+const SHELL_CANDIDATES = [
+  process.env.QQ_ADMIN_EXEC_SHELL,
+  'pwsh',
+  'pwsh.exe',
+  'powershell.exe',
+  'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
+].filter((x) => typeof x === 'string' && x !== '')
+
+function runOne(program, command, cwd, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = spawn(program, ['-NoProfile', '-NonInteractive', '-Command', command], {
+      cwd: typeof cwd === 'string' && cwd !== '' ? cwd : process.cwd(),
+      windowsHide: true,
+      shell: false,
+    })
+    let out = ''
+    let err = ''
+    let settled = false
+    let code = null
+    const finish = (c, note) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      const merged = (out + (err ? (out ? '\n' : '') + err : '') + (note ? '\n' + note : '')).trim()
+      const text = merged.length > MAX_OUTPUT_CHARS
+        ? '…[前文截断]…\n' + merged.slice(-MAX_OUTPUT_CHARS)
+        : merged
+      resolve({ code: c, text, enoent: false })
+    }
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch { /* 已退出 */ }
+      finish(code === null ? -1 : code, `[timeout ${timeoutMs}ms 已终止]`)
+    }, timeoutMs)
+    timer.unref?.()
+    child.stdout.on('data', (b) => { out += b.toString('utf8') })
+    child.stderr.on('data', (b) => { err += b.toString('utf8') })
+    child.on('error', (error) => {
+      if (settled) return
+      if (error?.code === 'ENOENT') {
+        settled = true
+        clearTimeout(timer)
+        resolve({ code: -1, text: '', enoent: true })
+        return
+      }
+      finish(-1, `[spawn 失败] ${error?.message ?? error}`)
+    })
+    child.on('close', (c) => { code = c; finish(c ?? -1, null) })
+  })
+}
+
+async function runPwsh(command, cwd, timeoutMs) {
+  const tried = []
+  for (const program of SHELL_CANDIDATES) {
+    const result = await runOne(program, command, cwd, timeoutMs)
+    if (!result.enoent) return { code: result.code, text: result.text }
+    tried.push(program)
+  }
+  return { code: -1, text: `[没有可用的 PowerShell 执行器] 试过: ${tried.join(', ')}` }
+}
+
+// --- cf_fetch: read-only Cloudflare-resistant page fetcher (group + private) ---
+// 只读：起本机真 Chrome 走 cf-fetch.mjs 过 CF 的 managed/JS 盾，取渲染后的正文。
+// 不执行任意命令、不改文件；群聊/私聊都能用。私网/本机地址一律拒绝（防 SSRF）。
+const NODE_CMD = 'C:\\\\Users\\\\USER\\AppData\\Roaming\\dsh-desktop\\harness\\.desktop-bin\\node.cmd'
+const CF_FETCH = 'C:\\\\Users\\\\USER\\dsh-plugins\\cf-fetch.mjs'
+const CF_MAX_CHARS = 12000
+
+function cfUrlBlocked(u) {
+  let host = ''
+  try { host = new URL(u).hostname.toLowerCase() } catch { return true }
+  if (host === 'localhost' || host === '::1' || host.endsWith('.local')) return true
+  if (/^127\./.test(host) || /^10\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return true
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true
+  if (host === '0.0.0.0' || host === '[::1]') return true
+  return false
+}
+
+function runCfFetch(url, timeoutMs, asHtml) {
+  return new Promise((resolve) => {
+    const out = join(tmpdir(), 'cffetch-' + Date.now() + '-' + Math.random().toString(36).slice(2) + '.txt')
+    const argv = ['/c', NODE_CMD, CF_FETCH, '--url', url, '--out', out, '--timeout', String(timeoutMs)]
+    if (asHtml) argv.push('--html')
+    let child
+    try { child = spawn('cmd.exe', argv, { windowsHide: true }) } catch (err) { resolve({ code: -1, text: 'spawn失败: ' + (err && err.message) }); return }
+    let so = ''
+    let se = ''
+    let settled = false
+    const done = (code, note) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      let txt = ''
+      try { txt = readFileSync(out, 'utf8') } catch { txt = ((so || '') + (se ? '\n' + se : '')).trim() }
+      try { unlinkSync(out) } catch { /* ignore */ }
+      if (note) txt = txt ? (txt + '\n' + note) : note
+      if (txt.length > CF_MAX_CHARS) txt = '…[前文截断]\n' + txt.slice(-CF_MAX_CHARS)
+      resolve({ code: code == null ? -1 : code, text: txt })
+    }
+    const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch { /* ignore */ } ; done(-1, '[timeout ' + timeoutMs + 'ms 已终止]') }, timeoutMs + 15000)
+    timer.unref?.()
+    child.stdout.on('data', (b) => { so += b.toString('utf8') })
+    child.stderr.on('data', (b) => { se += b.toString('utf8') })
+    child.on('error', (err) => done(-1, '[spawn 失败] ' + (err && err.message)))
+    child.on('close', (c) => done(c, null))
+  })
+}
+
+export function apply(ctx) {
+  ctx.tools.register({
+    name: 'local_exec',
+    description:
+      '在本机执行一条 PowerShell 命令（pwsh -NoProfile -Command），返回退出码和合并后的 stdout/stderr。'
+      + '用于管理员在 QQ 私聊里直接指挥干活：跑命令、查进程、读写文件、装东西都可以用它。'
+      + '命令请整条传（含分号、引号按 PowerShell 写法），需要长任务就 run_in_background 之外自己拆短。'
+      + '仅限管理员私聊会话调用，其他会话调用会被拒绝。',
+    parameters: {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: '要执行的 PowerShell 脚本，整条传入' },
+        cwd: { type: 'string', description: '工作目录（可选，默认宿主当前目录）' },
+        timeoutMs: { type: 'integer', description: `超时毫秒，默认 ${DEFAULT_TIMEOUT_MS}，上限 ${MAX_TIMEOUT_MS}` },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { code: { type: 'integer' }, text: { type: 'string' } },
+        required: ['code', 'text'],
+      },
+      render: (_args, value) => {
+        const v = value ?? {}
+        const body = typeof v.text === 'string' && v.text !== '' ? v.text : '(无输出)'
+        return [{ type: 'text', text: `exit=${v.code ?? '?'}\n${body}` }]
+      },
+    },
+    timeoutMs: MAX_TIMEOUT_MS + 10000,
+    async execute(args, exec) {
+      const sessionId = String(exec?.agent?.session?.id ?? '')
+      if (!allowPrefixes().some((p) => sessionId.startsWith(p))) {
+        throw new Error('local_exec 只允许管理员私聊会话调用')
+      }
+      const command = typeof args?.command === 'string' ? args.command : ''
+      if (command.trim() === '') throw new Error('command 不能为空')
+      const raw = Number(args?.timeoutMs)
+      const timeoutMs = Number.isFinite(raw) && raw > 0 ? Math.min(raw, MAX_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS
+      return runPwsh(command, typeof args?.cwd === 'string' ? args.cwd : '', timeoutMs)
+    },
+  })
+
+  // cf_fetch：只读抓取被 Cloudflare 拦的网页（群聊 + 私聊都可用）。
+  ctx.tools.register({
+    name: 'cf_fetch',
+    description:
+      '只读抓取一个网页的正文：用本机真 Chrome 过 Cloudflare 的 managed/JS 盾，返回渲染后的纯文本（可选 HTML）。'
+      + '专治 web_fetch 抓不动的 CF 站；只读、不执行命令、不改文件，群聊和私聊都可直接用。'
+      + '若返回 Just a moment/请稍候，说明没过盾（点选式 Turnstile 需人工），直接说没过即可。',
+    parameters: {
+      type: 'object',
+      properties: {
+        url: { type: 'string', description: '要抓取的 http(s) 网页地址（公网）' },
+        timeoutMs: { type: 'integer', description: '超时毫秒，默认 60000，上限 120000' },
+        html: { type: 'boolean', description: 'true 返回整页 HTML，默认返回纯文本正文' },
+      },
+      required: ['url'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: { code: { type: 'integer' }, text: { type: 'string' } },
+        required: ['code', 'text'],
+      },
+      render: (_args, value) => {
+        const v = value ?? {}
+        const body = typeof v.text === 'string' && v.text !== '' ? v.text : '(无正文)'
+        return [{ type: 'text', text: 'exit=' + (v.code ?? '?') + '\n' + body }]
+      },
+    },
+    timeoutMs: 140000,
+    async execute(args) {
+      const url = typeof args?.url === 'string' ? args.url.trim() : ''
+      if (!/^https?:\/\//i.test(url)) throw new Error('url 必须是 http(s) 地址')
+      if (cfUrlBlocked(url)) throw new Error('拒绝访问本机/私网地址')
+      const rawT = Number(args?.timeoutMs)
+      const to = Number.isFinite(rawT) && rawT > 0 ? Math.min(rawT, 120000) : 60000
+      return runCfFetch(url, to, args?.html === true)
+    },
+  })
+  // gen_image: private-session-only, image generation only (no arbitrary shell). Runs fixed nai-free.ps1.
+  ctx.tools.register({
+    name: 'gen_image',
+    description: 'Generate image(s) from english danbooru tags (NSFW ok). PRIVATE sessions only, image only (not a shell). Returns absolute png paths to pass to qq_send_image.',
+    parameters: { type: 'object', properties: { prompt: { type: 'string' }, count: { type: 'integer' } }, required: ['prompt'], additionalProperties: false },
+    output: { schema: { type: 'object', properties: { code: { type: 'integer' }, text: { type: 'string' }, files: { type: 'array', items: { type: 'string' } } }, required: ['code', 'text'] }, render: (_a, v) => { const x = v ?? {}; return [{ type: 'text', text: 'exit=' + (x.code ?? '?') + '\n' + (x.text || '') }] } },
+    timeoutMs: 300000,
+    async execute(args, exec) {
+      const sessionId = String(exec?.agent?.session?.id ?? '')
+      if (!sessionId.startsWith('onebot-private-')) throw new Error('gen_image only in private chat')
+      const prompt = typeof args?.prompt === 'string' ? args.prompt.trim() : ''
+      if (!prompt) throw new Error('prompt required')
+      if (prompt.length > 1500) throw new Error('prompt too long')
+      const rawC = Number(args?.count)
+      const count = Number.isFinite(rawC) && rawC > 0 ? Math.min(Math.floor(rawC), 4) : 1
+      const stamp = 'gi' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5)
+      const script = 'C:\\\\Users\\\\USER\\dsh-plugins\\nai-free.ps1'
+      const media = 'C:\\\\Users\\\\USER\\AppData\\Roaming\\dsh-desktop\\harness\\media\\onebot'
+      const argv = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Prompt', prompt, '-Name', stamp, '-Count', String(count)]
+      const out = await new Promise((resolve) => {
+        let text = ''
+        let child
+        try { child = spawn('powershell.exe', argv, { windowsHide: true }) } catch (e) { resolve({ code: -1, text: 'spawn fail: ' + (e && e.message) }); return }
+        const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch {} }, 280000); timer.unref?.()
+        child.stdout.on('data', (b) => { text += b.toString('utf8') })
+        child.stderr.on('data', (b) => { text += b.toString('utf8') })
+        child.on('error', (e) => { clearTimeout(timer); resolve({ code: -1, text: 'spawn error: ' + (e && e.message) }) })
+        child.on('close', (cc) => { clearTimeout(timer); resolve({ code: cc ?? -1, text }) })
+      })
+      let files = []
+      try { files = readdirSync(media).filter((f) => f.startsWith('sticker-' + stamp) && f.toLowerCase().endsWith('.png')).map((f) => media + '\\' + f) } catch {}
+      if (files.length === 0) return { code: out.code, text: (out.text || '') + '\n(no png produced)', files: [] }
+      return { code: out.code, text: 'done:\n' + files.join('\n'), files }
+    },
+  })
+}

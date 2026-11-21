@@ -1,0 +1,23 @@
+# 凭据与密钥，永远别提交
+*.credentials*
+credentials.*
+*.token
+*.secret
+*-keys.txt
+pid_*
+*.pem
+*.key
+
+# 本地状态与缓存
+*.state
+*.log
+node_modules/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 产出物（插件自带的图片资源要保留，只忽略根目录和 out/ 下的产物）
+/output/
+out/
+dist/
+build/
