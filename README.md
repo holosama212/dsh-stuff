@@ -28,7 +28,7 @@ Get-ChildItem . -Recurse -File -Include *.ps1,*.mjs,*.py,*.json |
 ## 目录
 
 ```
-plugins/    5 个 DSH 插件
+plugins/    1 个 DSH 插件
 scripts/    44 个运维/出图/QQ 相关脚本
 ```
 
@@ -37,10 +37,6 @@ scripts/    44 个运维/出图/QQ 相关脚本
 | 插件 | 干什么 |
 |---|---|
 | `dsh-qq-affinity` | QQ 好感度系统。每人 0–100 独立存档，提供 `affinity` 工具给模型查/调 |
-| `qq-mode-console` | QQ 会话的模式控制台（查看/切换当前会话的工作模式） |
-| `qq-agent-presets` | 预设管理，支持管理员通过 QQ 直接执行受限命令 |
-| `dsh-bili-subagent` | 派子代理去刷 B 站：搜视频、读字幕、挑值得看的、汇报 |
-| `dsh-infinite-gen-x` | 一套生成类提示词框架（角色/场景/叙事扩展） |
 
 装法：整个目录丢进 `%APPDATA%\dsh-desktop\harness\plugins\`，然后在 DSH 的 bundle 配置里挂上，重启 DSH。
 
